@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>QuickVarSet</name>
+  <description>Add or update quantity variables in a FreeCAD VarSet from any workbench.</description>
+  <version>0.2.0</version>
+  <date>2026-10-10</date>
+  <maintainer email="kamil.renczewski@gmail.com">Kamil Renczewski</maintainer>
+  <license>UNLICENSED</license>
+  <icon>resources/QuickVarSet.svg</icon>
+
+  <content>
+    <macro>
+      <name>QuickVarSet</name>
+      <description>Add or update quantity variables in a FreeCAD VarSet from any workbench.</description>
+      <version>0.2.0</version>
+      <subdirectory>./</subdirectory>
+      <file>QuickVarSet.FCMacro</file>
+      <icon>resources/QuickVarSet.svg</icon>
+      <freecadmin>1.1.0</freecadmin>
+      <tag>utility</tag>
+    </macro>
+  </content>
+</package>

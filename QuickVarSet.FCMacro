@@ -1,0 +1,881 @@
+# QuickVarSet
+#
+# Add or update a quantity variable in a FreeCAD VarSet.
+#
+# Run this macro from any workbench, including while a sketch is being edited.
+# Add the macro in Tools -> Customize -> Macros to assign a keyboard shortcut.
+
+__Name__ = "QuickVarSet"
+__Comment__ = "Add or update quantity variables in a FreeCAD VarSet."
+__Author__ = "Kamil Renczewski"
+__Version__ = "0.2.0"
+__Date__ = "2026-10-10"
+__License__ = "UNLICENSED"
+__Web__ = ""
+__Wiki__ = ""
+__Icon__ = ""
+__Help__ = "Run the macro and enter Name = Value or Group/Name = Value."
+__Status__ = "Beta"
+__Requires__ = "FreeCAD >= 1.1"
+__Communication__ = ""
+__Files__ = ""
+
+import re
+import traceback
+
+import FreeCAD as App
+
+try:
+    import FreeCADGui as Gui
+except ImportError:
+    Gui = None
+
+DEFAULT_GROUP_NAME = "Base"
+
+SYSTEM_PROPERTY_NAMES = frozenset(
+    {
+        "ExpressionEngine",
+        "Group",
+        "Label",
+        "Label2",
+        "Name",
+        "Visibility",
+    }
+)
+
+UNIT_PROPERTY_TYPES = {
+    "Angle": "App::PropertyAngle",
+    "Area": "App::PropertyArea",
+    "Volume": "App::PropertyVolume",
+    "Mass": "App::PropertyMass",
+    "TimeSpan": "App::PropertyTime",
+    "Velocity": "App::PropertyVelocity",
+    "Acceleration": "App::PropertyAcceleration",
+    "Force": "App::PropertyForce",
+    "Pressure": "App::PropertyPressure",
+    "Energy": "App::PropertyWork",
+    "Power": "App::PropertyPower",
+    "Temperature": "App::PropertyTemperature",
+    "Frequency": "App::PropertyFrequency",
+    "ElectricCurrent": "App::PropertyElectricCurrent",
+    "ElectricPotential": "App::PropertyElectricPotential",
+    "ElectricalCapacitance": "App::PropertyElectricalCapacitance",
+    "ElectricalInductance": "App::PropertyElectricalInductance",
+    "ElectricalConductance": "App::PropertyElectricalConductance",
+    "ElectricalResistance": "App::PropertyElectricalResistance",
+    "ElectricCharge": "App::PropertyElectricCharge",
+    "Density": "App::PropertyDensity",
+}
+
+
+class QuickVarSetError(Exception):
+    """An expected, user-facing QuickVarSet operation error."""
+
+
+class QuickVarSetCancelled(Exception):
+    """The user declined a confirmation dialog."""
+
+
+def _log(logger, level, message):
+    if logger is not None:
+        logger(level, message)
+
+
+def property_exists(obj, name):
+    return name in obj.PropertiesList
+
+
+def is_system_property(name):
+    return name in SYSTEM_PROPERTY_NAMES
+
+
+def get_user_properties(obj):
+    """Return properties that can represent user variables."""
+
+    return [
+        name
+        for name in obj.PropertiesList
+        if not is_system_property(name)
+    ]
+
+
+def get_existing_groups(obj):
+    """Return user-property groups in the order used by the VarSet."""
+
+    groups = []
+
+    for name in get_user_properties(obj):
+        try:
+            group = obj.getGroupOfProperty(name)
+        except Exception:
+            group = None
+
+        if group and group not in groups:
+            groups.append(group)
+
+    return groups
+
+
+def format_group_summary(existing_groups, default_group):
+    groups = existing_groups or [default_group]
+    groups = ", ".join(
+        f"[{group}]" if group == default_group else group
+        for group in groups
+    )
+    return f"Existing groups (default marked by [square brackets]): {groups}"
+
+
+def get_property_expression(obj, name):
+    try:
+        expression = obj.getExpression(name)
+    except Exception:
+        return None
+
+    return expression or None
+
+
+def get_property_unit_type(obj, name):
+    """Return a property's unit dimension, or None for non-quantities."""
+
+    try:
+        prop = obj.getPropertyByName(name)
+        return prop.Unit.Type
+    except Exception:
+        return None
+
+
+def get_quantity_value(quantity):
+    try:
+        return quantity.Value
+    except Exception:
+        return quantity.getValue()
+
+
+def is_negative_quantity(quantity):
+    return get_quantity_value(quantity) < 0
+
+
+def get_new_property_type(quantity):
+    """Return the property class needed for a new quantity."""
+
+    unit_type = quantity.Unit.Type
+
+    if unit_type == "Length":
+        if is_negative_quantity(quantity):
+            return "App::PropertyDistance"
+        return "App::PropertyLength"
+
+    return UNIT_PROPERTY_TYPES.get(unit_type, "App::PropertyQuantity")
+
+
+def _normalize_group(group):
+    group = group.strip().replace(" ", "_")
+
+    if not group:
+        raise QuickVarSetError("Group name cannot be empty.")
+
+    return group
+
+
+def _split_group_and_name(text):
+    if "/" not in text:
+        return None, text.strip()
+
+    group, name = text.split("/", 1)
+    group = _normalize_group(group)
+    return group, name.strip()
+
+
+def _syntax_error():
+    return QuickVarSetError(
+        "Syntax must be either:\n"
+        "  Name=Value\n"
+        "or\n"
+        "  Name Value\n"
+        "Optional group prefixes use Group/Name."
+    )
+
+
+def parse_input(text):
+    """Parse the supported QuickVarSet input forms."""
+
+    text = text.strip()
+
+    if not text:
+        raise QuickVarSetError("Input is empty.")
+
+    group_name = None
+
+    if "=" in text:
+        raw_name, value_text = text.split("=", 1)
+        group_name, raw_name = _split_group_and_name(raw_name.strip())
+        value_text = value_text.strip()
+    else:
+        parts = text.split(None, 1)
+
+        if len(parts) != 2:
+            if parts and parts[0].endswith("/"):
+                group = _normalize_group(parts[0][:-1])
+                raise QuickVarSetError(
+                    f"Group '{group}' selected. "
+                    "Enter a parameter after '/'."
+                )
+            raise _syntax_error()
+
+        first, remainder = parts
+
+        if first.endswith("/"):
+            group_name = _normalize_group(first[:-1])
+            name_parts = remainder.split(None, 1)
+
+            if len(name_parts) != 2:
+                raise _syntax_error()
+
+            raw_name, value_text = name_parts
+        elif "/" in first:
+            group_name, raw_name = _split_group_and_name(first)
+            value_text = remainder.strip()
+        else:
+            raw_name = first
+            value_text = remainder.strip()
+
+    if not raw_name:
+        raise QuickVarSetError("Parameter name cannot be empty.")
+
+    if not value_text:
+        raise QuickVarSetError("Parameter value cannot be empty.")
+
+    name = raw_name.replace(" ", "_")
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise QuickVarSetError(
+            f"Invalid parameter name '{raw_name}'. Use letters, numbers, "
+            "and underscores, with a letter or underscore first."
+        )
+
+    if is_system_property(name):
+        raise QuickVarSetError(
+            f"'{name}' is a built-in VarSet property and cannot be used "
+            "as a QuickVarSet variable."
+        )
+
+    try:
+        quantity = App.Units.Quantity(value_text)
+    except Exception as err:
+        raise QuickVarSetError(
+            f"Cannot parse value '{value_text}': {err}"
+        ) from err
+
+    return group_name, name, value_text, quantity
+
+
+def _set_property_group(obj, name, group):
+    try:
+        obj.setGroupOfProperty(name, group)
+        actual_group = obj.getGroupOfProperty(name)
+    except Exception as err:
+        raise QuickVarSetError(
+            f"Could not move property '{name}' to group '{group}': {err}"
+        ) from err
+
+    if actual_group != group:
+        raise QuickVarSetError(
+            f"Could not move property '{name}' to group '{group}'. "
+            f"FreeCAD reports group '{actual_group}'."
+        )
+
+
+def _add_property(obj, property_type, name, group):
+    try:
+        obj.addProperty(property_type, name, group, "")
+    except Exception as err:
+        raise QuickVarSetError(
+            f"FreeCAD could not create '{name}' as {property_type}: {err}"
+        ) from err
+
+    if not property_exists(obj, name):
+        raise QuickVarSetError(
+            f"FreeCAD did not create property '{name}' even though "
+            "addProperty returned."
+        )
+
+    actual_type = obj.getTypeIdOfProperty(name)
+
+    if actual_type != property_type:
+        raise QuickVarSetError(
+            f"FreeCAD created '{name}' as {actual_type}, expected "
+            f"{property_type}."
+        )
+
+
+def _assign_value(obj, name, quantity):
+    try:
+        setattr(obj, name, quantity)
+    except Exception as err:
+        raise QuickVarSetError(
+            f"FreeCAD could not set '{name}' to '{quantity}': {err}"
+        ) from err
+
+    try:
+        actual_quantity = getattr(obj, name)
+        actual_value = get_quantity_value(actual_quantity)
+        expected_value = get_quantity_value(quantity)
+    except Exception as err:
+        raise QuickVarSetError(
+            f"FreeCAD set '{name}', but QuickVarSet could not verify "
+            f"the stored value: {err}"
+        ) from err
+
+    tolerance = 1e-9 * max(1.0, abs(expected_value))
+
+    if abs(actual_value - expected_value) > tolerance:
+        raise QuickVarSetError(
+            f"FreeCAD stored '{name}' as '{actual_quantity}', expected "
+            f"'{quantity}'."
+        )
+
+
+def _recreate_property(
+    obj,
+    name,
+    property_type,
+    group,
+    quantity,
+    old_expression,
+    logger,
+):
+    try:
+        obj.removeProperty(name)
+    except Exception as err:
+        raise QuickVarSetError(
+            f"FreeCAD could not remove '{name}' for recreation: {err}"
+        ) from err
+
+    if property_exists(obj, name):
+        raise QuickVarSetError(
+            f"FreeCAD did not remove '{name}' before recreation."
+        )
+
+    _add_property(obj, property_type, name, group)
+    _assign_value(obj, name, quantity)
+
+    if old_expression:
+        try:
+            obj.setExpression(name, old_expression)
+        except Exception as err:
+            _log(
+                logger,
+                "warning",
+                f"Could not restore expression for '{name}': {err}",
+            )
+
+
+def _confirm(
+    confirm_change,
+    name,
+    current_type,
+    requested_type,
+    reason,
+    current_group,
+    requested_group,
+    current_expression,
+):
+    if confirm_change is None:
+        raise QuickVarSetError(
+            "A confirmation callback is required before changing a "
+            "property type."
+        )
+
+    confirmed = confirm_change(
+        name,
+        current_type,
+        requested_type,
+        reason,
+        current_group,
+        requested_group,
+        current_expression,
+    )
+
+    if not confirmed:
+        raise QuickVarSetCancelled(f"Change cancelled for '{name}'.")
+
+
+def apply_input(
+    doc,
+    target_varset,
+    text,
+    default_group,
+    confirm_change=None,
+    logger=None,
+):
+    """Apply one parsed input to a VarSet and return an operation result."""
+
+    if doc is None:
+        raise QuickVarSetError("No active document found.")
+
+    if target_varset is None:
+        raise QuickVarSetError("No target VarSet was selected.")
+
+    default_group = _normalize_group(default_group or DEFAULT_GROUP_NAME)
+    group_name, name, value_text, quantity = parse_input(text)
+
+    if group_name:
+        requested_group = group_name
+    else:
+        requested_group = default_group
+
+    if property_exists(target_varset, name):
+        if is_system_property(name):
+            raise QuickVarSetError(
+                f"'{name}' is a built-in VarSet property and cannot be "
+                "modified as a user variable."
+            )
+
+        try:
+            existing_type = target_varset.getTypeIdOfProperty(name)
+        except Exception as err:
+            raise QuickVarSetError(
+                f"Could not inspect existing property '{name}': {err}"
+            ) from err
+
+        existing_unit_type = get_property_unit_type(target_varset, name)
+
+        try:
+            existing_group = target_varset.getGroupOfProperty(name)
+        except Exception:
+            existing_group = None
+
+        existing_group = existing_group or default_group
+        requested_group = group_name or existing_group
+        current_expression = get_property_expression(target_varset, name)
+
+        same_dimension = (
+            existing_unit_type is not None
+            and existing_unit_type == quantity.Unit.Type
+        )
+
+        needs_negative_length_change = (
+            same_dimension
+            and quantity.Unit.Type == "Length"
+            and is_negative_quantity(quantity)
+            and existing_type == "App::PropertyLength"
+        )
+
+        if needs_negative_length_change:
+            requested_type = "App::PropertyDistance"
+            reason = (
+                "The value is negative, but the existing PropertyLength "
+                "cannot contain negative values. The property must be "
+                "recreated as PropertyDistance."
+            )
+
+            _confirm(
+                confirm_change,
+                name,
+                existing_type,
+                requested_type,
+                reason,
+                existing_group,
+                requested_group,
+                current_expression,
+            )
+
+            _recreate_property(
+                target_varset,
+                name,
+                requested_type,
+                requested_group,
+                quantity,
+                current_expression,
+                logger,
+            )
+            doc.recompute()
+
+            return {
+                "action": "recreated",
+                "name": name,
+                "value": value_text,
+                "property_type": requested_type,
+                "unit_type": quantity.Unit.Type,
+                "group": requested_group,
+            }
+
+        if same_dimension:
+            _assign_value(target_varset, name, quantity)
+
+            if group_name and existing_group != requested_group:
+                _set_property_group(
+                    target_varset,
+                    name,
+                    requested_group,
+                )
+
+            doc.recompute()
+
+            return {
+                "action": "updated",
+                "name": name,
+                "value": value_text,
+                "property_type": existing_type,
+                "unit_type": quantity.Unit.Type,
+                "group": requested_group,
+            }
+
+        requested_type = get_new_property_type(quantity)
+        reason = (
+            "The requested value has a different unit dimension from the "
+            "existing property. The property must be recreated."
+        )
+
+        _confirm(
+            confirm_change,
+            name,
+            existing_type,
+            requested_type,
+            reason,
+            existing_group,
+            requested_group,
+            current_expression,
+        )
+
+        _recreate_property(
+            target_varset,
+            name,
+            requested_type,
+            requested_group,
+            quantity,
+            current_expression,
+            logger,
+        )
+        doc.recompute()
+
+        return {
+            "action": "recreated",
+            "name": name,
+            "value": value_text,
+            "property_type": requested_type,
+            "unit_type": quantity.Unit.Type,
+            "group": requested_group,
+        }
+
+    property_type = get_new_property_type(quantity)
+
+    _add_property(target_varset, property_type, name, requested_group)
+    _assign_value(target_varset, name, quantity)
+    doc.recompute()
+
+    return {
+        "action": "created",
+        "name": name,
+        "value": value_text,
+        "property_type": property_type,
+        "unit_type": quantity.Unit.Type,
+        "group": requested_group,
+    }
+
+
+PARAM_PATH = "User parameter:BaseApp/Preferences/Macros/QuickVarSet"
+
+
+def _qt_widgets():
+    from PySide import QtWidgets
+    return QtWidgets
+
+
+def _exec_dialog(dialog):
+    exec_method = getattr(dialog, "exec", None)
+    if exec_method is None:
+        exec_method = dialog.exec_
+    return exec_method()
+
+
+def _console_log(level, message):
+    prefix = "[QuickVarSet] "
+    text = prefix + message + "\n"
+
+    if level == "error":
+        App.Console.PrintError(text)
+    elif level == "warning":
+        App.Console.PrintWarning(text)
+    else:
+        App.Console.PrintMessage(text)
+
+
+def _show_error_dialog(title, message, details):
+    if Gui is None or not getattr(App, "GuiUp", False):
+        return
+
+    try:
+        QtWidgets = _qt_widgets()
+        box = QtWidgets.QMessageBox()
+        box.setIcon(QtWidgets.QMessageBox.Critical)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.setDetailedText(details)
+        _exec_dialog(box)
+    except Exception as err:
+        _console_log("warning", f"Could not show error dialog: {err}")
+
+
+def _report_exception(err):
+    details = traceback.format_exc()
+    _console_log("error", f"Operation failed: {err}")
+
+    for line in details.rstrip().splitlines():
+        _console_log("error", line)
+
+    _show_error_dialog(
+        "QuickVarSet Error",
+        str(err),
+        details,
+    )
+
+
+def confirm_property_change(
+    prop_name,
+    current_type,
+    requested_type,
+    reason,
+    current_group,
+    requested_group,
+    current_expression,
+):
+    QtWidgets = _qt_widgets()
+    dialog = QtWidgets.QDialog()
+    dialog.setWindowTitle("Confirm Property Change")
+    dialog.resize(700, 500)
+
+    layout = QtWidgets.QVBoxLayout(dialog)
+    message_lines = [
+        f"Property: {prop_name}",
+        "",
+        "Current type:",
+        current_type,
+        "",
+        "Requested type:",
+        requested_type,
+        "",
+        reason,
+        "",
+        "Current group:",
+        current_group,
+        "",
+        "Requested group:",
+        requested_group,
+    ]
+
+    if current_expression:
+        message_lines.extend(
+            [
+                "",
+                "Current expression:",
+                current_expression,
+                "",
+                "The expression may need to be restored after "
+                "the property is recreated.",
+            ]
+        )
+
+    message_lines.extend(
+        [
+            "",
+            "This operation may break expressions, constraints, "
+            "sketches, or other references that use this property.",
+        ]
+    )
+
+    text_edit = QtWidgets.QPlainTextEdit()
+    text_edit.setReadOnly(True)
+    text_edit.setPlainText("\n".join(message_lines))
+    text_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+    layout.addWidget(text_edit)
+
+    checkbox = QtWidgets.QCheckBox(
+        "I understand that this operation may break references"
+    )
+    layout.addWidget(checkbox)
+
+    buttons = QtWidgets.QDialogButtonBox(
+        QtWidgets.QDialogButtonBox.Ok
+        | QtWidgets.QDialogButtonBox.Cancel
+    )
+    ok_button = buttons.button(QtWidgets.QDialogButtonBox.Ok)
+    ok_button.setEnabled(False)
+    checkbox.toggled.connect(ok_button.setEnabled)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+
+    return _exec_dialog(dialog) == QtWidgets.QDialog.Accepted
+
+
+class QuickVarDialog:
+
+    def __init__(
+        self,
+        parent,
+        varset_display,
+        default_group,
+        existing_groups=None,
+    ):
+        QtWidgets = _qt_widgets()
+        self._dialog = QtWidgets.QDialog(parent)
+        self._dialog.setWindowTitle(
+            f"Quick Add Parameter [{varset_display}]"
+        )
+        self._dialog.resize(700, 400)
+        self._default_group = default_group
+        self._existing_groups = list(existing_groups or [default_group])
+
+        layout = QtWidgets.QVBoxLayout(self._dialog)
+
+        self._target_label = QtWidgets.QLabel()
+        self._target_label.setWordWrap(True)
+        self._target_label.setText(
+            format_group_summary(self._existing_groups, default_group)
+        )
+        layout.addWidget(self._target_label)
+
+        help_label = QtWidgets.QLabel(
+            "<b>Syntax:</b><br>"
+            "&nbsp;&nbsp;Name = Value<br>"
+            "&nbsp;&nbsp;Name Value<br>"
+            "&nbsp;&nbsp;Group/Name = Value<br>"
+            "&nbsp;&nbsp;Group/ Name Value<br><br>"
+            "<b>Examples:</b><br>"
+            "&nbsp;&nbsp;Width = 10mm<br>"
+            "&nbsp;&nbsp;Speed = 10 m/s<br>"
+            "&nbsp;&nbsp;Common/Width = 10mm<br>"
+            "&nbsp;&nbsp;Common/ Width -1 mm<br><br>"
+            "An explicit group overrides the property's current group. "
+            "Missing groups are created automatically."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        self._input = QtWidgets.QLineEdit()
+        self._input.setPlaceholderText("e.g. Common/Width = 10mm")
+        layout.addWidget(self._input)
+
+        self._buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok
+            | QtWidgets.QDialogButtonBox.Cancel
+        )
+        self._ok_button = self._buttons.button(
+            QtWidgets.QDialogButtonBox.Ok
+        )
+        self._ok_button.setEnabled(False)
+        self._buttons.accepted.connect(self.try_accept)
+        self._buttons.rejected.connect(self._dialog.reject)
+        layout.addWidget(self._buttons)
+
+        self._input.textChanged.connect(self.update_target_display)
+        self._input.returnPressed.connect(self.try_accept)
+        self.update_target_display("")
+
+    def update_target_display(self, text):
+        self._ok_button.setEnabled(bool(text.strip()))
+
+    def try_accept(self):
+        if self._input.text().strip():
+            self._dialog.accept()
+
+    def exec(self):
+        return _exec_dialog(self._dialog)
+
+    def get_text(self):
+        return self._input.text().strip()
+
+
+def _select_target_varset(doc):
+    QtWidgets = _qt_widgets()
+    varsets = [
+        obj
+        for obj in doc.Objects
+        if obj.isDerivedFrom("App::VarSet")
+    ]
+
+    if not varsets:
+        target = doc.addObject("App::VarSet", "VarSet")
+
+        if target is None:
+            raise RuntimeError("FreeCAD did not create the initial VarSet.")
+
+        _console_log("info", f"Created VarSet '{target.Name}'.")
+        return target
+
+    if len(varsets) == 1:
+        return varsets[0]
+
+    items = [
+        f"{index + 1}: {varset.Label} ({varset.Name})"
+        for index, varset in enumerate(varsets)
+    ]
+    item, ok = QtWidgets.QInputDialog.getItem(
+        None,
+        "Select VarSet",
+        "Choose VarSet:",
+        items,
+        0,
+        False,
+    )
+
+    if not ok or not item:
+        raise QuickVarSetCancelled("VarSet selection cancelled.")
+
+    return varsets[items.index(item)]
+
+
+def run_quickvarset():
+    try:
+        doc = App.ActiveDocument
+
+        if doc is None:
+            raise RuntimeError("No active document found.")
+
+        target_varset = _select_target_varset(doc)
+        target_display = f"{target_varset.Label} ({target_varset.Name})"
+
+        existing_groups = get_existing_groups(target_varset)
+        if not existing_groups:
+            existing_groups = [DEFAULT_GROUP_NAME]
+
+        param = App.ParamGet(PARAM_PATH)
+        last_group = param.GetString("LastGroup", "")
+        default_group = (
+            last_group if last_group in existing_groups else existing_groups[0]
+        )
+
+        dialog = QuickVarDialog(
+            None,
+            target_display,
+            default_group,
+            existing_groups,
+        )
+
+        if dialog.exec() != _qt_widgets().QDialog.Accepted:
+            raise QuickVarSetCancelled("Cancelled.")
+
+        result = apply_input(
+            doc,
+            target_varset,
+            dialog.get_text(),
+            default_group,
+            confirm_change=confirm_property_change,
+            logger=_console_log,
+        )
+
+        param.SetString("LastGroup", result["group"])
+        _console_log(
+            "info",
+            f"{result['action'].capitalize()} '{result['name']}' = "
+            f"{result['value']} as {result['property_type']} "
+            f"in group '{result['group']}'.",
+        )
+    except QuickVarSetCancelled as err:
+        _console_log("info", str(err))
+    except Exception as err:
+        _report_exception(err)
+
+
+run_quickvarset()
