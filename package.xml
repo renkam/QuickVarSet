@@ -5,7 +5,7 @@
   <version>0.2.0</version>
   <date>2026-10-10</date>
   <maintainer email="kamil.renczewski@gmail.com">Kamil Renczewski</maintainer>
-  <license>UNLICENSED</license>
+  <license>LGPL-2.1-or-later</license>
   <icon>resources/QuickVarSet.svg</icon>
 
   <content>

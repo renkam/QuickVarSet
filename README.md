@@ -1,5 +1,8 @@
 # QuickVarSet
 
+[![Tests](https://github.com/renkam/QuickVarSet/actions/workflows/tests.yml/badge.svg)](https://github.com/renkam/QuickVarSet/actions/workflows/tests.yml)
+[![License: LGPL-2.1-or-later](https://img.shields.io/badge/License-LGPL--2.1--or--later-blue.svg)](LICENSE)
+
 QuickVarSet is a standalone FreeCAD macro for creating and updating quantity
 properties in `App::VarSet` objects.
 
@@ -94,3 +97,9 @@ The formula editor may still list them because they are built-in object
 properties.
 Removing those suggestions would require a FreeCAD expression-editor change,
 not a macro change.
+
+## License
+
+QuickVarSet is licensed under the GNU Lesser General Public License, version
+2.1 or any later version.
+See [LICENSE](LICENSE) for the full license text.
