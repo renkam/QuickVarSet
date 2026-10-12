@@ -116,6 +116,122 @@ def get_existing_groups(obj):
     return groups
 
 
+def _normalize_search_text(text):
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+def _extract_search_group_and_name(text):
+    name_text = text.split("=", 1)[0].strip()
+
+    if "=" not in text:
+        parts = name_text.split(None, 1)
+
+        if not parts:
+            return None, ""
+
+        if parts[0].endswith("/"):
+            group = parts[0][:-1].strip().replace(" ", "_")
+            remainder = parts[1] if len(parts) == 2 else ""
+            name_text = remainder.split(None, 1)[0] if remainder else ""
+            return group or None, name_text
+
+        name_text = parts[0]
+
+    if "/" not in name_text:
+        return None, name_text
+
+    group, name = name_text.split("/", 1)
+    group = group.strip().replace(" ", "_")
+    return group or None, name.strip()
+
+
+def _fuzzy_match_score(query, candidate):
+    query_key = _normalize_search_text(query)
+    candidate_key = _normalize_search_text(candidate)
+
+    if not query_key:
+        return (3, 0, 0, 0)
+
+    if query_key == candidate_key:
+        return (0, 0, 0, len(candidate_key))
+
+    substring_start = candidate_key.find(query_key)
+    if substring_start >= 0:
+        return (1, substring_start, 0, 0)
+
+    matched_positions = []
+    next_position = 0
+
+    for character in query_key:
+        position = candidate_key.find(character, next_position)
+        if position < 0:
+            return None
+        matched_positions.append(position)
+        next_position = position + 1
+
+    gaps = sum(
+        current - previous - 1
+        for previous, current in zip(
+            matched_positions,
+            matched_positions[1:],
+        )
+    )
+    return (2, gaps, matched_positions[0], len(candidate_key))
+
+
+def get_parameter_matches(obj, text):
+    """Return fuzzy-matched user parameters for the dialog preview."""
+
+    if obj is None:
+        return []
+
+    group_query, name_query = _extract_search_group_and_name(text)
+    normalized_group_query = (
+        group_query.casefold() if group_query else None
+    )
+    matches = []
+
+    for name in get_user_properties(obj):
+        try:
+            group = obj.getGroupOfProperty(name)
+        except Exception:
+            group = None
+
+        group = group or DEFAULT_GROUP_NAME
+        if (
+            normalized_group_query
+            and group.casefold() != normalized_group_query
+        ):
+            continue
+
+        score = _fuzzy_match_score(name_query, name)
+        if score is None:
+            continue
+
+        try:
+            value = str(getattr(obj, name))
+        except Exception:
+            value = "<unavailable>"
+
+        matches.append(
+            {
+                "group": group,
+                "name": name,
+                "value": value,
+                "score": score,
+            }
+        )
+
+    matches.sort(
+        key=lambda match: (
+            match["score"],
+            match["name"].casefold(),
+            match["group"].casefold(),
+        )
+    )
+    return matches
+
+
 def format_group_summary(existing_groups, default_group):
     groups = existing_groups or [default_group]
     groups = ", ".join(
@@ -582,6 +698,23 @@ def _qt_widgets():
     return QtWidgets
 
 
+def _qt_core():
+    from PySide import QtCore
+    return QtCore
+
+
+def _qt_constant(enum_name, member_name):
+    Qt = _qt_core().Qt
+    enum = getattr(Qt, enum_name, None)
+
+    if enum is not None:
+        member = getattr(enum, member_name, None)
+        if member is not None:
+            return member
+
+    return getattr(Qt, member_name)
+
+
 def _exec_dialog(dialog):
     exec_method = getattr(dialog, "exec", None)
     if exec_method is None:
@@ -709,6 +842,23 @@ def confirm_property_change(
     return _exec_dialog(dialog) == QtWidgets.QDialog.Accepted
 
 
+class QuickVarLineEdit(_qt_widgets().QLineEdit):
+
+    def __init__(self, parent, key_handler):
+        super().__init__(parent)
+        self._key_handler = key_handler
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        if self._key_handler(key):
+            event.accept()
+            return
+
+        self._key_handler(None)
+        super().keyPressEvent(event)
+
+
 class QuickVarDialog:
 
     def __init__(
@@ -717,6 +867,7 @@ class QuickVarDialog:
         varset_display,
         default_group,
         existing_groups=None,
+        target_varset=None,
     ):
         QtWidgets = _qt_widgets()
         self._dialog = QtWidgets.QDialog(parent)
@@ -726,6 +877,11 @@ class QuickVarDialog:
         self._dialog.resize(700, 400)
         self._default_group = default_group
         self._existing_groups = list(existing_groups or [default_group])
+        self._varset = target_varset
+        self._matches = []
+        self._navigation_index = None
+        self._navigation_original_text = None
+        self._setting_suggestion = False
 
         layout = QtWidgets.QVBoxLayout(self._dialog)
 
@@ -753,9 +909,28 @@ class QuickVarDialog:
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
 
-        self._input = QtWidgets.QLineEdit()
+        preview_info = QtWidgets.QLabel(
+            "<b>Preview:</b> type to search; "
+            "Up/Down lists and selects; Left restores."
+        )
+        preview_info.setWordWrap(True)
+        layout.addWidget(preview_info)
+
+        self._input = QuickVarLineEdit(
+            self._dialog,
+            self._handle_input_key,
+        )
         self._input.setPlaceholderText("e.g. Common/Width = 10mm")
         layout.addWidget(self._input)
+
+        self._preview = QtWidgets.QListWidget()
+        self._preview.setFocusPolicy(
+            _qt_constant("FocusPolicy", "NoFocus")
+        )
+        self._preview.setMaximumHeight(320)
+        self._preview.itemClicked.connect(self._preview_item_clicked)
+        self._preview.hide()
+        layout.addWidget(self._preview)
 
         self._buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok
@@ -771,10 +946,105 @@ class QuickVarDialog:
 
         self._input.textChanged.connect(self.update_target_display)
         self._input.returnPressed.connect(self.try_accept)
+        self._input.setFocus()
         self.update_target_display("")
 
     def update_target_display(self, text):
         self._ok_button.setEnabled(bool(text.strip()))
+
+        if self._setting_suggestion:
+            return
+
+        self._navigation_index = None
+        self._navigation_original_text = None
+        self._matches = (
+            get_parameter_matches(self._varset, text)
+            if text.strip()
+            else []
+        )
+        self._refresh_preview()
+
+    def _refresh_preview(self):
+        self._preview.clear()
+        for match in self._matches:
+            self._preview.addItem(
+                f"{match['group']}/{match['name']} = {match['value']}"
+            )
+
+        self._preview.setCurrentRow(-1)
+        self._preview.setVisible(bool(self._matches))
+
+    def _handle_input_key(self, key):
+        if key == _qt_constant("Key", "Key_Up"):
+            return self._navigate_preview(-1)
+
+        if key == _qt_constant("Key", "Key_Down"):
+            return self._navigate_preview(1)
+
+        if key == _qt_constant("Key", "Key_Left"):
+            if self._navigation_original_text is None:
+                return False
+            self._restore_navigation()
+            return True
+
+        self._clear_navigation()
+        return False
+
+    def _clear_navigation(self):
+        self._navigation_index = None
+        self._navigation_original_text = None
+        self._preview.setCurrentRow(-1)
+
+    def _navigate_preview(self, direction):
+        if not self._matches:
+            if self._input.text().strip():
+                return False
+
+            self._matches = get_parameter_matches(self._varset, "")
+            self._refresh_preview()
+
+            if not self._matches:
+                return False
+
+        if self._navigation_original_text is None:
+            self._navigation_original_text = self._input.text()
+            self._navigation_index = (
+                -1 if direction > 0 else len(self._matches)
+            )
+
+        self._navigation_index = (
+            self._navigation_index + direction
+        ) % len(self._matches)
+        self._set_preview_match(self._navigation_index)
+        return True
+
+    def _set_preview_match(self, index):
+        match = self._matches[index]
+        prefix = f"{match['group']}/{match['name']} = "
+        text = prefix + match["value"]
+        self._setting_suggestion = True
+        self._input.setText(text)
+        self._setting_suggestion = False
+        self._input.setSelection(len(prefix), len(match["value"]))
+        self._preview.setCurrentRow(index)
+
+    def _preview_item_clicked(self, item):
+        index = self._preview.row(item)
+
+        if index < 0:
+            return
+
+        if self._navigation_original_text is None:
+            self._navigation_original_text = self._input.text()
+        self._navigation_index = index
+        self._set_preview_match(index)
+        self._input.setFocus()
+
+    def _restore_navigation(self):
+        original_text = self._navigation_original_text
+        self._clear_navigation()
+        self._input.setText(original_text)
+        self._input.setCursorPosition(len(original_text))
 
     def try_accept(self):
         if self._input.text().strip():
@@ -851,6 +1121,7 @@ def run_quickvarset():
             target_display,
             default_group,
             existing_groups,
+            target_varset=target_varset,
         )
 
         if dialog.exec() != _qt_widgets().QDialog.Accepted:
