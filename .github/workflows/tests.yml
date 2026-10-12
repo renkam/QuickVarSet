@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    env:
+      FREECAD_VERSION: 1.1.1
+      FREECAD_APPIMAGE_NAME: FreeCAD_1.1.1-Linux-x86_64-py311.AppImage
+      FREECAD_APPIMAGE_SHA256: e2006138400b2fa85fa2e160e872d00767eb32964e85075830f7e198a3a876e1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download FreeCAD AppImage
+        run: |
+          mkdir -p "$HOME/apps"
+          curl --fail --location --retry 3 \
+            --output "$HOME/apps/$FREECAD_APPIMAGE_NAME" \
+            "https://github.com/FreeCAD/FreeCAD/releases/download/$FREECAD_VERSION/$FREECAD_APPIMAGE_NAME"
+          chmod +x "$HOME/apps/$FREECAD_APPIMAGE_NAME"
+
+      - name: Verify FreeCAD AppImage
+        run: |
+          echo "$FREECAD_APPIMAGE_SHA256  $HOME/apps/$FREECAD_APPIMAGE_NAME" \
+            | sha256sum --check --strict
+
+      - name: Run tests
+        run: FREECAD_APPIMAGE="$HOME/apps/$FREECAD_APPIMAGE_NAME" ./tests/run_tests.sh
