@@ -10,6 +10,8 @@ import FreeCAD as App
 
 
 DEFAULT_GROUP_NAME = "Base"
+DIMENSIONLESS_UNIT_TYPE = "1"
+DIMENSIONLESS_PROPERTY_TYPE = "App::PropertyFloat"
 
 # These properties are supplied by App::VarSet itself.  They are not user
 # variables and must not be offered as formula candidates by this addon.
@@ -80,16 +82,22 @@ def get_user_properties(obj):
     ]
 
 
+def get_property_group(obj, name, fallback=DEFAULT_GROUP_NAME):
+    try:
+        if obj.getTypeIdOfProperty(name) == DIMENSIONLESS_PROPERTY_TYPE:
+            return fallback
+        return obj.getGroupOfProperty(name)
+    except Exception:
+        return None
+
+
 def get_existing_groups(obj):
     """Return user-property groups in the order used by the VarSet."""
 
     groups = []
 
     for name in get_user_properties(obj):
-        try:
-            group = obj.getGroupOfProperty(name)
-        except Exception:
-            group = None
+        group = get_property_group(obj, name)
 
         if group and group not in groups:
             groups.append(group)
@@ -110,6 +118,9 @@ def get_property_unit_type(obj, name):
     """Return a property's unit dimension, or None for non-quantities."""
 
     try:
+        property_type = obj.getTypeIdOfProperty(name)
+        if property_type == DIMENSIONLESS_PROPERTY_TYPE:
+            return DIMENSIONLESS_UNIT_TYPE
         prop = obj.getPropertyByName(name)
         return prop.Unit.Type
     except Exception:
@@ -131,6 +142,9 @@ def get_new_property_type(quantity):
     """Return the property class needed for a new quantity."""
 
     unit_type = quantity.Unit.Type
+
+    if unit_type == DIMENSIONLESS_UNIT_TYPE:
+        return DIMENSIONLESS_PROPERTY_TYPE
 
     if unit_type == "Length":
         if is_negative_quantity(quantity):
@@ -286,7 +300,13 @@ def _add_property(obj, property_type, name, group):
 
 def _assign_value(obj, name, quantity):
     try:
-        setattr(obj, name, quantity)
+        property_type = obj.getTypeIdOfProperty(name)
+        assigned_value = (
+            quantity.Value
+            if property_type == DIMENSIONLESS_PROPERTY_TYPE
+            else quantity
+        )
+        setattr(obj, name, assigned_value)
     except Exception as err:
         raise QuickVarSetError(
             f"FreeCAD could not set '{name}' to '{quantity}': {err}"
@@ -294,7 +314,11 @@ def _assign_value(obj, name, quantity):
 
     try:
         actual_quantity = getattr(obj, name)
-        actual_value = get_quantity_value(actual_quantity)
+        actual_value = (
+            float(actual_quantity)
+            if property_type == DIMENSIONLESS_PROPERTY_TYPE
+            else get_quantity_value(actual_quantity)
+        )
         expected_value = get_quantity_value(quantity)
     except Exception as err:
         raise QuickVarSetError(
@@ -309,6 +333,11 @@ def _assign_value(obj, name, quantity):
             f"FreeCAD stored '{name}' as '{actual_quantity}', expected "
             f"'{quantity}'."
         )
+
+
+def _recompute_if_supported(doc, property_type):
+    if property_type != DIMENSIONLESS_PROPERTY_TYPE:
+        doc.recompute()
 
 
 def _recreate_property(
@@ -416,12 +445,11 @@ def apply_input(
 
         existing_unit_type = get_property_unit_type(target_varset, name)
 
-        try:
-            existing_group = target_varset.getGroupOfProperty(name)
-        except Exception:
-            existing_group = None
-
-        existing_group = existing_group or default_group
+        existing_group = get_property_group(
+            target_varset,
+            name,
+            default_group,
+        ) or default_group
         requested_group = group_name or existing_group
         current_expression = get_property_expression(target_varset, name)
 
@@ -465,7 +493,7 @@ def apply_input(
                 current_expression,
                 logger,
             )
-            doc.recompute()
+            _recompute_if_supported(doc, requested_type)
 
             return {
                 "action": "recreated",
@@ -480,13 +508,18 @@ def apply_input(
             _assign_value(target_varset, name, quantity)
 
             if group_name and existing_group != requested_group:
+                if existing_type == DIMENSIONLESS_PROPERTY_TYPE:
+                    raise QuickVarSetError(
+                        f"Cannot move dimensionless property '{name}' "
+                        "between groups in FreeCAD 1.1.1."
+                    )
                 _set_property_group(
                     target_varset,
                     name,
                     requested_group,
                 )
 
-            doc.recompute()
+            _recompute_if_supported(doc, existing_type)
 
             return {
                 "action": "updated",
@@ -523,7 +556,7 @@ def apply_input(
             current_expression,
             logger,
         )
-        doc.recompute()
+        _recompute_if_supported(doc, requested_type)
 
         return {
             "action": "recreated",
@@ -538,7 +571,7 @@ def apply_input(
 
     _add_property(target_varset, property_type, name, requested_group)
     _assign_value(target_varset, name, quantity)
-    doc.recompute()
+    _recompute_if_supported(doc, property_type)
 
     return {
         "action": "created",

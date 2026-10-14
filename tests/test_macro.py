@@ -76,6 +76,23 @@ class QuickVarSetMacroTests(unittest.TestCase):
             "App::PropertyLength",
         )
 
+    def test_macro_handles_dimensionless_values(self):
+        _, namespace = load_macro_definitions()
+
+        result = namespace["apply_input"](
+            self.doc,
+            self.varset,
+            "FrontTopSideCutHeight = 7",
+            "Base",
+        )
+
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(
+            self.varset.getTypeIdOfProperty("FrontTopSideCutHeight"),
+            "App::PropertyFloat",
+        )
+        self.assertAlmostEqual(self.varset.FrontTopSideCutHeight, 7.0)
+
     def test_group_summary_preserves_group_names_and_default(self):
         _, namespace = load_macro_definitions()
 

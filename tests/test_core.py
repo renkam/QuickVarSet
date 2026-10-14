@@ -49,6 +49,33 @@ class QuickVarSetCoreTests(unittest.TestCase):
         )
         self.assertAlmostEqual(self.varset.Speed.getValueAs("m/s"), 10.0)
 
+    def test_dimensionless_value_creates_float_property(self):
+        result = apply_input(
+            self.doc,
+            self.varset,
+            "FrontTopSideCutHeight = 7",
+            "Base",
+            confirm_change=lambda *args: True,
+        )
+
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(
+            self.varset.getTypeIdOfProperty("FrontTopSideCutHeight"),
+            "App::PropertyFloat",
+        )
+        self.assertAlmostEqual(self.varset.FrontTopSideCutHeight, 7.0)
+
+        updated = apply_input(
+            self.doc,
+            self.varset,
+            "FrontTopSideCutHeight = 8",
+            "Base",
+            confirm_change=lambda *args: True,
+        )
+
+        self.assertEqual(updated["action"], "updated")
+        self.assertAlmostEqual(self.varset.FrontTopSideCutHeight, 8.0)
+
     def test_create_and_update_quantity(self):
         created = apply_input(
             self.doc,
